@@ -5,7 +5,9 @@ else
 JANSSON_INCLUDES=
 endif
 
-EXTRA_DIST	= example-cfg.json nomacro.pl
+EXTRA_DIST	= example-cfg.json nomacro.pl m4/libcurl.m4
+
+ACLOCAL_AMFLAGS = -I m4
 
 SUBDIRS		= compat
 
