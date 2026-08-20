@@ -104,11 +104,13 @@ struct workio_cmd {
 enum algos {
 	ALGO_SCRYPT,		/* scrypt(1024,1,1) */
 	ALGO_SHA256D,		/* SHA-256d */
+	ALGO_LYRA2WEB,		/* Lyra2-webchain (MintMe) */
 };
 
 static const char *algo_names[] = {
 	[ALGO_SCRYPT]		= "scrypt",
 	[ALGO_SHA256D]		= "sha256d",
+	[ALGO_LYRA2WEB]		= "lyra2web",
 };
 
 bool opt_debug = false;
@@ -147,6 +149,7 @@ int longpoll_thr_id = -1;
 int stratum_thr_id = -1;
 struct work_restart *work_restart = NULL;
 static struct stratum_ctx stratum;
+static time_t stratum_last_ka;
 
 pthread_mutex_t applog_lock;
 static pthread_mutex_t stats_lock;
@@ -267,6 +270,13 @@ struct work {
 	char *job_id;
 	size_t xnonce2_len;
 	unsigned char *xnonce2;
+
+	/* Webchain (MintMe) job blob: full block template passed to Lyra2;
+	 * data[17..18] hold the 64-bit nonce, data[32..63] receive the
+	 * 32-byte winning hash from scanhash_lyra2web (data[31] keeps the
+	 * blob length for the scanhash wrapper). */
+	unsigned char *blob;
+	size_t blob_size;
 };
 
 static struct work g_work;
@@ -281,6 +291,8 @@ static inline void work_free(struct work *w)
 	free(w->workid);
 	free(w->job_id);
 	free(w->xnonce2);
+	free(w->blob);
+	w->blob = NULL;
 }
 
 static inline void work_copy(struct work *dest, const struct work *src)
@@ -295,6 +307,10 @@ static inline void work_copy(struct work *dest, const struct work *src)
 	if (src->xnonce2) {
 		dest->xnonce2 = malloc(src->xnonce2_len);
 		memcpy(dest->xnonce2, src->xnonce2, src->xnonce2_len);
+	}
+	if (src->blob) {
+		dest->blob = malloc(src->blob_size);
+		memcpy(dest->blob, src->blob, src->blob_size);
 	}
 }
 
@@ -713,25 +729,55 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	bool rc = false;
 
 	/* pass if the previous hash is not the current previous hash */
-	if (!submit_old && memcmp(work->data + 1, g_work.data + 1, 32)) {
-		if (opt_debug)
-			applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
-		return true;
+	if (!submit_old) {
+		if (opt_algo == ALGO_LYRA2WEB) {
+			/* Webchain work carries no header in data[]: the
+			 * submitted work belongs to the current job when the
+			 * job ids match. */
+			if (!work->job_id || !g_work.job_id ||
+			    strcmp(work->job_id, g_work.job_id)) {
+				if (opt_debug)
+					applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
+				return true;
+			}
+		} else if (memcmp(work->data + 1, g_work.data + 1, 32)) {
+			if (opt_debug)
+				applog(LOG_DEBUG, "DEBUG: stale work detected, discarding");
+			return true;
+		}
 	}
-
 	if (have_stratum) {
 		uint32_t ntime, nonce;
-		char ntimestr[9], noncestr[9], *xnonce2str, *req;
-
+		char ntimestr[9], noncestr[17], *xnonce2str, *req;
 		le32enc(&ntime, work->data[17]);
 		le32enc(&nonce, work->data[19]);
 		bin2hex(ntimestr, (const unsigned char *)(&ntime), 4);
-		bin2hex(noncestr, (const unsigned char *)(&nonce), 4);
 		xnonce2str = abin2hex(work->xnonce2, work->xnonce2_len);
-		req = malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
-		sprintf(req,
-			"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
-			rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
+		if (opt_algo == ALGO_LYRA2WEB) {
+			char hashstr[65];
+			/* Webchain (MintMe) stratum submit, matching the
+			 * mintme-com/miner wire format:
+			 * {"id":<seq>,"jsonrpc":"2.0","method":"submit",
+			 *  "worker":"<user>",
+			 *  "params":{"id":"<rpc id from login>","job_id":"...",
+			 *            "nonce":"<16 hex LE 8-byte nonce>",
+			 *            "result":"<64 hex LE 32-byte hash>"}} */
+			const char *rpc_id = stratum.wc_rpc_id ? stratum.wc_rpc_id : "";
+			bin2hex(noncestr, (const unsigned char *)(work->data + 17), 8);
+			bin2hex(hashstr, (const unsigned char *)work->data + 32, 32);
+			req = malloc(350 + strlen(rpc_id) + strlen(work->job_id) + strlen(rpc_user));
+			sprintf(req,
+				"{\"id\": %d, \"jsonrpc\": \"2.0\", \"method\": \"submit\", "
+				"\"worker\": \"%s\", \"params\": {\"id\": \"%s\", "
+				"\"job_id\": \"%s\", \"nonce\": \"%s\", \"result\": \"%s\"}}",
+				++stratum.wc_seq, rpc_user, rpc_id,
+				work->job_id, noncestr, hashstr);
+		} else {
+			req = malloc(256 + strlen(rpc_user) + strlen(work->job_id) + 2 * work->xnonce2_len);
+			sprintf(req,
+				"{\"method\": \"mining.submit\", \"params\": [\"%s\", \"%s\", \"%s\", \"%s\", \"%s\"], \"id\":4}",
+				rpc_user, work->job_id, xnonce2str, ntimestr, noncestr);
+		}
 		free(xnonce2str);
 
 		rc = stratum_send_line(&stratum, req);
@@ -1014,6 +1060,21 @@ static bool get_work(struct thr_info *thr, struct work *work)
 		work->data[20] = 0x80000000;
 		work->data[31] = 0x00000280;
 		memset(work->target, 0x00, sizeof(work->target));
+		if (opt_algo == ALGO_LYRA2WEB) {
+			/* Big-endian Webchain comparison: hash bytes read as BE
+			 * uint64 must be <= target. With the two lowest LE words
+			 * set to 0xffffffff the check always passes, so the
+			 * benchmark can report a hashrate. */
+			work->target[0] = 0xffffffffU;
+			work->target[1] = 0xffffffffU;
+			work->blob = malloc(76);
+			if (!work->blob)
+				return false;
+			memset(work->blob, 0x55, 76);
+			memcpy(work->blob + 68, &work->data[17], 4);
+			memcpy(work->blob + 72, &work->data[18], 4);
+			work->blob_size = 76;
+		}
 		return true;
 	}
 
@@ -1075,11 +1136,27 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 {
 	unsigned char merkle_root[64];
 	int i;
-
 	pthread_mutex_lock(&sctx->work_lock);
-
 	free(work->job_id);
 	work->job_id = strdup(sctx->job.job_id);
+	if (sctx->is_webchain) {
+		/* Webchain job: raw blob + LE-layout target from the pool. */
+		free(work->blob);
+		work->blob = malloc(sctx->wc_blob_len);
+		memcpy(work->blob, sctx->wc_blob, sctx->wc_blob_len);
+		work->blob_size = sctx->wc_blob_len;
+		memset(work->target, 0, sizeof(work->target));
+		memcpy(work->target, sctx->wc_target, 8);
+		/* nonce words are supplied by the miner thread itself */
+		work->data[17] = 0;
+		work->data[18] = 0;
+		pthread_mutex_unlock(&sctx->work_lock);
+		if (opt_debug)
+			applog(LOG_DEBUG, "DEBUG: webchain job_id='%s' blob=%zu target=%016llx",
+			       work->job_id, work->blob_size,
+			       (unsigned long long)(((uint64_t)work->target[1] << 32) | work->target[0]));
+		return;
+	}
 	work->xnonce2_len = sctx->xnonce2_size;
 	work->xnonce2 = realloc(work->xnonce2, sctx->xnonce2_size);
 	memcpy(work->xnonce2, sctx->job.xnonce2, sctx->xnonce2_size);
@@ -1129,6 +1206,7 @@ static void *miner_thread(void *userdata)
 	memset(&work, 0, sizeof(work));
 	uint32_t max_nonce;
 	uint32_t end_nonce = 0xffffffffU / opt_n_threads * (thr_id + 1) - 0x20;
+	bool lyra2web_nonce = opt_algo == ALGO_LYRA2WEB;
 	unsigned char *scratchbuf = NULL;
 	char s[16];
 	int i;
@@ -1158,6 +1236,14 @@ static void *miner_thread(void *userdata)
 			exit(1);
 		}
 	}
+	if (opt_algo == ALGO_LYRA2WEB) {
+		scratchbuf = lyra2web_buffer_alloc();
+		if (!scratchbuf) {
+			applog(LOG_ERR, "lyra2web buffer allocation failed");
+			pthread_mutex_lock(&applog_lock);
+			exit(1);
+		}
+	}
 
 	while (1) {
 		unsigned long hashes_done;
@@ -1167,9 +1253,14 @@ static void *miner_thread(void *userdata)
 
 		if (have_stratum) {
 			while (time(NULL) >= g_work_time + 120)
-				sleep(1);
+			sleep(1);
 			pthread_mutex_lock(&g_work_lock);
-			if (work.data[19] >= end_nonce && !memcmp(work.data, g_work.data, 76))
+			if (lyra2web_nonce ? (work.data[17] >= (uint32_t)end_nonce &&
+			    work.blob && g_work.blob &&
+			    work.blob_size == g_work.blob_size &&
+			    !memcmp(work.blob + 8, g_work.blob + 8, work.blob_size - 8)) :
+			    (work.data[19] >= end_nonce &&
+			    !memcmp(work.data, g_work.data, 76)))
 				stratum_gen_work(&stratum, &g_work);
 		} else {
 			int min_scantime = have_longpoll ? LP_SCANTIME : opt_scantime;
@@ -1177,7 +1268,8 @@ static void *miner_thread(void *userdata)
 			pthread_mutex_lock(&g_work_lock);
 			if (!have_stratum &&
 			    (time(NULL) - g_work_time >= min_scantime ||
-			     work.data[19] >= end_nonce)) {
+			     (lyra2web_nonce ? work.data[17] >= (uint32_t)end_nonce :
+			     work.data[19] >= end_nonce))) {
 				work_free(&g_work);
 				if (unlikely(!get_work(mythr, &g_work))) {
 					applog(LOG_ERR, "work retrieval failed, exiting "
@@ -1192,7 +1284,20 @@ static void *miner_thread(void *userdata)
 				continue;
 			}
 		}
-		if (memcmp(work.data, g_work.data, 76)) {
+		if (lyra2web_nonce) {
+			if (!work.blob || !g_work.blob ||
+			    work.blob_size != g_work.blob_size ||
+			    memcmp(work.blob, g_work.blob, work.blob_size)) {
+				work_free(&work);
+				work_copy(&work, &g_work);
+				work.data[17] = 0xffffffffU / opt_n_threads * thr_id;
+				work.data[18] = 0;
+			} else {
+				work.data[17]++;
+				if (!work.data[17])
+					work.data[18]++;
+			}
+		} else if (memcmp(work.data, g_work.data, 76)) {
 			work_free(&work);
 			work_copy(&work, &g_work);
 			work.data[19] = 0xffffffffU / opt_n_threads * thr_id;
@@ -1216,12 +1321,23 @@ static void *miner_thread(void *userdata)
 			case ALGO_SHA256D:
 				max64 = 0x1fffff;
 				break;
+			case ALGO_LYRA2WEB:
+				/* 6 MB memory-hard hash: ~0.1-0.5 H/s per thread */
+				max64 = 0x3fff;
+				break;
 			}
 		}
-		if (work.data[19] + max64 > end_nonce)
-			max_nonce = end_nonce;
-		else
-			max_nonce = work.data[19] + max64;
+		if (lyra2web_nonce) {
+			if (max64 > (int64_t)(end_nonce - work.data[17]))
+				max_nonce = end_nonce;
+			else
+				max_nonce = work.data[17] + (uint32_t)max64;
+		} else {
+			if (work.data[19] + max64 > end_nonce)
+				max_nonce = end_nonce;
+			else
+				max_nonce = work.data[19] + (uint32_t)max64;
+		}
 		
 		hashes_done = 0;
 		gettimeofday(&tv_start, NULL);
@@ -1233,12 +1349,21 @@ static void *miner_thread(void *userdata)
 			                     max_nonce, &hashes_done, opt_scrypt_n);
 			break;
 
-		case ALGO_SHA256D:
-			rc = scanhash_sha256d(thr_id, work.data, work.target,
-			                      max_nonce, &hashes_done);
-			break;
+			case ALGO_SHA256D:
+				rc = scanhash_sha256d(thr_id, work.data, work.target,
+				                      max_nonce, &hashes_done);
+				break;
 
-		default:
+			case ALGO_LYRA2WEB:
+				/* Webchain nonce lives in work.data[17..18]; the full
+				 * job blob is scanned, and the winning 32-byte hash is
+				 * returned in work.data[32..63]. */
+				rc = scanhash_lyra2web(thr_id, work.data, work.blob,
+				                       work.blob_size, scratchbuf, work.target,
+				                       max_nonce, &hashes_done);
+				break;
+
+			default:
 			/* should never happen */
 			goto out;
 		}
@@ -1402,16 +1527,30 @@ static bool stratum_handle_response(char *buf)
 		goto out;
 	}
 
-	res_val = json_object_get(val, "result");
+		res_val = json_object_get(val, "result");
 	err_val = json_object_get(val, "error");
 	id_val = json_object_get(val, "id");
-
 	if (!id_val || json_is_null(id_val) || !res_val)
 		goto out;
-
-	share_result(json_is_true(res_val),
-		err_val ? json_string_value(json_array_get(err_val, 1)) : NULL);
-
+	if (err_val && json_is_array(err_val))
+		share_result(json_is_true(res_val),
+			json_string_value(json_array_get(err_val, 1)));
+	else if (err_val && json_is_object(err_val))
+		share_result(json_is_true(res_val),
+			json_string_value(json_object_get(err_val, "message")));
+	else if (stratum.is_webchain && json_is_object(res_val)) {
+		/* Webchain pools (mintme-com/pool) answer submit with
+		 * result = {"status": "OK"} instead of a plain boolean. */
+		const char *status = json_string_value(
+			json_object_get(res_val, "status"));
+		if (status && !strcasecmp(status, "OK"))
+			share_result(true, NULL);
+		else
+			share_result(false,
+				json_string_value(json_object_get(res_val, "error")));
+	}
+	else
+		share_result(json_is_true(res_val), NULL);
 	ret = true;
 out:
 	if (val)
@@ -1440,8 +1579,10 @@ static void *stratum_thread(void *userdata)
 			restart_threads();
 
 			if (!stratum_connect(&stratum, stratum.url) ||
-			    !stratum_subscribe(&stratum) ||
-			    !stratum_authorize(&stratum, rpc_user, rpc_pass)) {
+			    (opt_algo == ALGO_LYRA2WEB ?
+			     !stratum_webchain_login(&stratum, rpc_user, rpc_pass) :
+			     (!stratum_subscribe(&stratum) ||
+			      !stratum_authorize(&stratum, rpc_user, rpc_pass)))) {
 				stratum_disconnect(&stratum);
 				if (opt_retries >= 0 && ++failures > opt_retries) {
 					applog(LOG_ERR, "...terminating workio thread");
@@ -1468,8 +1609,34 @@ static void *stratum_thread(void *userdata)
 		if (!stratum_socket_full(&stratum, 120)) {
 			applog(LOG_ERR, "Stratum connection timed out");
 			s = NULL;
-		} else
-			s = stratum_recv_line(&stratum);
+		} else {
+			s = stratum_recv_line_timeout(&stratum, 1);
+			if (stratum.is_webchain) {
+				/* Webchain servers expect periodic keepalived
+				 * probes from the miner (every 15s). */
+				time_t now = time(NULL);
+				if (!stratum_last_ka)
+					stratum_last_ka = now;
+				if (now - stratum_last_ka >= 15) {
+					char ka[256];
+					if (stratum.wc_rpc_id)
+						snprintf(ka, sizeof(ka),
+							"{\"id\": %d, \"jsonrpc\": \"2.0\", "
+							"\"method\": \"keepalived\", "
+							"\"params\": {\"id\": \"%s\"}}\n",
+							++stratum.wc_seq, stratum.wc_rpc_id);
+					else
+						snprintf(ka, sizeof(ka),
+							"{\"id\": %d, \"jsonrpc\": \"2.0\", "
+							"\"method\": \"keepalived\", "
+							"\"params\": {}}\n",
+							++stratum.wc_seq);
+					stratum_send_line(&stratum, ka);
+					stratum_last_ka = now;
+					continue;
+				}
+			}
+		}
 		if (!s) {
 			stratum_disconnect(&stratum);
 			applog(LOG_ERR, "Stratum connection interrupted");
@@ -1479,7 +1646,6 @@ static void *stratum_thread(void *userdata)
 			stratum_handle_response(s);
 		free(s);
 	}
-
 out:
 	return NULL;
 }
@@ -1948,6 +2114,10 @@ int main(int argc, char *argv[])
 	work_restart = calloc(opt_n_threads, sizeof(*work_restart));
 	if (!work_restart)
 		return 1;
+	if (opt_algo == ALGO_LYRA2WEB && !lyra2web_test()) {
+		applog(LOG_ERR, "Lyra2-webchain self-test failed");
+		return 1;
+	}
 
 	thr_info = calloc(opt_n_threads + 3, sizeof(*thr));
 	if (!thr_info)

@@ -1053,6 +1053,71 @@ out:
 	return sret;
 }
 
+/* Variant of stratum_recv_line with a custom timeout (seconds). Used by
+ * the Webchain client loop to poll for server messages without blocking
+ * for a full minute. Returns NULL on timeout or error (no log noise). */
+char *stratum_recv_line_timeout(struct stratum_ctx *sctx, int timeout)
+{
+	ssize_t len, buflen;
+	char *tok, *sret = NULL;
+
+	if (!strstr(sctx->sockbuf, "\n")) {
+		bool ret = true;
+		time_t rstart;
+
+		time(&rstart);
+		if (!socket_full(sctx->sock, timeout))
+			return NULL;
+		do {
+			char s[RBUFSIZE];
+			ssize_t n;
+
+			memset(s, 0, RBUFSIZE);
+#if LIBCURL_VERSION_NUM >= 0x071202
+			CURLcode rc = curl_easy_recv(sctx->curl, s, RECVSIZE, (size_t *)&n);
+			if (rc == CURLE_OK && !n) {
+				ret = false;
+				break;
+			}
+			if (rc != CURLE_OK) {
+				if (rc != CURLE_AGAIN || !socket_full(sctx->sock, 1)) {
+#else
+			n = recv(sctx->sock, s, RECVSIZE, 0);
+			if (!n) {
+				ret = false;
+				break;
+			}
+			if (n < 0) {
+				if (!socket_blocks() || !socket_full(sctx->sock, 1)) {
+#endif
+					ret = false;
+					break;
+				}
+			} else
+				stratum_buffer_append(sctx, s);
+		} while (time(NULL) - rstart < timeout && !strstr(sctx->sockbuf, "\n"));
+
+		if (!ret)
+			return NULL;
+	}
+
+	buflen = strlen(sctx->sockbuf);
+	tok = strtok(sctx->sockbuf, "\n");
+	if (!tok)
+		return NULL;
+	sret = strdup(tok);
+	len = strlen(sret);
+
+	if (buflen > len + 1)
+		memmove(sctx->sockbuf, sctx->sockbuf + len + 1, buflen - len + 1);
+	else
+		sctx->sockbuf[0] = '\0';
+
+	if (sret && opt_protocol)
+		applog(LOG_DEBUG, "< %s", sret);
+	return sret;
+}
+
 #if LIBCURL_VERSION_NUM >= 0x071101 && LIBCURL_VERSION_NUM < 0x072d00
 static curl_socket_t opensocket_grab_cb(void *clientp, curlsocktype purpose,
 	struct curl_sockaddr *addr)
@@ -1144,6 +1209,17 @@ void stratum_disconnect(struct stratum_ctx *sctx)
 		sctx->sockbuf[0] = '\0';
 	}
 	pthread_mutex_unlock(&sctx->sock_lock);
+	pthread_mutex_lock(&sctx->work_lock);
+	free(sctx->wc_blob);
+	free(sctx->wc_rpc_id);
+	/* wc_job_id is aliased by sctx->job.job_id; clear both */
+	free(sctx->wc_job_id);
+	sctx->wc_blob = NULL;
+	sctx->wc_blob_len = 0;
+	sctx->wc_rpc_id = NULL;
+	sctx->wc_job_id = NULL;
+	sctx->job.job_id = NULL;
+	pthread_mutex_unlock(&sctx->work_lock);
 }
 
 static const char *get_stratum_session_id(json_t *val)
@@ -1503,6 +1579,127 @@ static bool stratum_show_message(struct stratum_ctx *sctx, json_t *id, json_t *p
 	return ret;
 }
 
+static bool stratum_webchain_parse_job(struct stratum_ctx *sctx, json_t *job)
+{
+	const char *blob_hex, *job_id, *target_hex;
+	unsigned char *blob;
+	size_t blob_len;
+
+	blob_hex = json_string_value(json_object_get(job, "blob"));
+	job_id = json_string_value(json_object_get(job, "job_id"));
+	target_hex = json_string_value(json_object_get(job, "target"));
+	if (!blob_hex || !job_id || !target_hex)
+		return false;
+
+	blob_len = strlen(blob_hex) / 2;
+	if (blob_len < 8 || blob_len > 4096 || strlen(target_hex) != 16)
+		return false;
+
+	blob = malloc(blob_len);
+	if (!blob)
+		return false;
+	if (!hex2bin(blob, blob_hex, blob_len)) {
+		free(blob);
+		return false;
+	}
+	if (!hex2bin(sctx->wc_target, target_hex, 8)) {
+		free(blob);
+		return false;
+	}
+
+	pthread_mutex_lock(&sctx->work_lock);
+	free(sctx->wc_blob);
+	free(sctx->wc_job_id);
+	sctx->wc_blob = blob;
+	sctx->wc_blob_len = blob_len;
+	sctx->wc_job_id = strdup(job_id);
+	sctx->job.job_id = sctx->wc_job_id;
+	pthread_mutex_unlock(&sctx->work_lock);
+
+	if (opt_debug)
+		applog(LOG_DEBUG, "DEBUG: webchain job blob=%zu target=%016llx",
+		       blob_len, (unsigned long long)
+		       (((uint64_t)sctx->wc_target[7] << 56) |
+		        ((uint64_t)sctx->wc_target[6] << 48) |
+		        ((uint64_t)sctx->wc_target[5] << 40) |
+		        ((uint64_t)sctx->wc_target[4] << 32) |
+		        ((uint64_t)sctx->wc_target[3] << 24) |
+		        ((uint64_t)sctx->wc_target[2] << 16) |
+		        ((uint64_t)sctx->wc_target[1] << 8) |
+		        (uint64_t)sctx->wc_target[0]));
+
+	return true;
+}
+
+/* Webchain (MintMe) handshake: login {login, pass} -> result {id, job}. */
+bool stratum_webchain_login(struct stratum_ctx *sctx, const char *user, const char *pass)
+{
+	json_t *val = NULL, *res_val, *err_val, *job;
+	char *s, *sret;
+	json_error_t err;
+	bool ret = false;
+
+	s = malloc(200 + strlen(user) + strlen(pass));
+	sprintf(s, "{\"id\": 1, \"jsonrpc\": \"2.0\", \"method\": \"login\", "
+	       "\"worker\": \"%s\", \"params\": "
+	       "{\"login\": \"%s\", \"pass\": \"%s\", \"agent\": \"cpuminer\"}}",
+	       user, user, pass);
+	if (!stratum_send_line(sctx, s))
+		goto out;
+	while (1) {
+		sret = stratum_recv_line(sctx);
+		if (!sret)
+			goto out;
+		if (!stratum_handle_method(sctx, sret))
+			break;
+		free(sret);
+	}
+	val = JSON_LOADS(sret, &err);
+	free(sret);
+	if (!val) {
+		applog(LOG_ERR, "JSON decode failed(%d): %s", err.line, err.text);
+		goto out;
+	}
+	res_val = json_object_get(val, "result");
+	err_val = json_object_get(val, "error");
+	if (!res_val || json_is_null(res_val) ||
+	    (err_val && !json_is_null(err_val))) {
+		if (opt_debug || err_val) {
+			char *es = json_dumps(err_val, JSON_INDENT(3));
+			applog(LOG_ERR, "Webchain login failed: %s", es ? es : "(unknown reason)");
+			free(es);
+		}
+		goto out;
+	}
+	job = json_object_get(res_val, "job");
+	if (!job || !stratum_webchain_parse_job(sctx, job)) {
+		applog(LOG_ERR, "Webchain login: no job in response");
+		goto out;
+	}
+	{
+		const char *rpc_id = json_string_value(json_object_get(res_val, "id"));
+		free(sctx->wc_rpc_id);
+		sctx->wc_rpc_id = rpc_id ? strdup(rpc_id) : NULL;
+	}
+	sctx->is_webchain = true;
+	ret = true;
+out:
+	free(s);
+	if (val)
+		json_decref(val);
+	return ret;
+}
+
+/* Webchain push: {"method": "job", "params": {blob, job_id, target}} */
+static bool stratum_webchain_job(struct stratum_ctx *sctx, json_t *params)
+{
+	if (!stratum_webchain_parse_job(sctx, params)) {
+		applog(LOG_ERR, "Webchain job: invalid parameters");
+		return false;
+	}
+	return true;
+}
+
 bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
 {
 	json_t *val, *id, *params;
@@ -1541,6 +1738,32 @@ bool stratum_handle_method(struct stratum_ctx *sctx, const char *s)
 	if (!strcasecmp(method, "client.show_message")) {
 		ret = stratum_show_message(sctx, id, params);
 		goto out;
+	}
+	if (sctx->is_webchain) {
+		if (!strcasecmp(method, "job")) {
+			ret = stratum_webchain_job(sctx, params);
+			goto out;
+		}
+		if (!strcasecmp(method, "keepalived")) {
+			char *r;
+			json_t *rval = json_object();
+			json_object_set(rval, "id", id ? id : json_integer(1));
+			json_object_set_new(rval, "error", json_null());
+			json_object_set_new(rval, "result", json_true());
+			{
+				json_t *params = json_object();
+				if (sctx->wc_rpc_id)
+					json_object_set_new(params, "id",
+					                    json_string(sctx->wc_rpc_id));
+				json_object_set(rval, "params", params);
+				json_decref(params);
+			}
+			r = json_dumps(rval, 0);
+			ret = stratum_send_line(sctx, r);
+			json_decref(rval);
+			free(r);
+			goto out;
+		}
 	}
 
 out:

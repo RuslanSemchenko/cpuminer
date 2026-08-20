@@ -122,6 +122,47 @@ static inline void le32enc(void *pp, uint32_t x)
 }
 #endif
 
+#ifndef bswap64
+#if ((__GNUC__ > 4) || (__GNUC__ == 4 && __GNUC_MINOR__ >= 3))
+#define bswap64(x) __builtin_bswap64(x)
+#else
+#define bswap64(x) ((((uint64_t)(x) & 0x00000000000000ffULL) << 56) | \
+    (((uint64_t)(x) & 0x000000000000ff00ULL) << 40) | \
+    (((uint64_t)(x) & 0x0000000000ff0000ULL) << 24) | \
+    (((uint64_t)(x) & 0x00000000ff000000ULL) << 8)  | \
+    (((uint64_t)(x) & 0x000000ff00000000ULL) >> 8)  | \
+    (((uint64_t)(x) & 0x0000ff0000000000ULL) >> 24) | \
+    (((uint64_t)(x) & 0x00ff000000000000ULL) >> 40) | \
+    (((uint64_t)(x) & 0xff00000000000000ULL) >> 56))
+#endif
+#endif
+
+#if !HAVE_DECL_LE64DEC
+static inline uint64_t le64dec(const void *pp)
+{
+	const uint8_t *p = (uint8_t const *)pp;
+	return ((uint64_t)(p[0]) + ((uint64_t)(p[1]) << 8) +
+	    ((uint64_t)(p[2]) << 16) + ((uint64_t)(p[3]) << 24) +
+	    ((uint64_t)(p[4]) << 32) + ((uint64_t)(p[5]) << 40) +
+	    ((uint64_t)(p[6]) << 48) + ((uint64_t)(p[7]) << 56));
+}
+#endif
+
+#if !HAVE_DECL_LE64ENC
+static inline void le64enc(void *pp, uint64_t x)
+{
+	uint8_t *p = (uint8_t *)pp;
+	p[0] = x & 0xff;
+	p[1] = (x >> 8) & 0xff;
+	p[2] = (x >> 16) & 0xff;
+	p[3] = (x >> 24) & 0xff;
+	p[4] = (x >> 32) & 0xff;
+	p[5] = (x >> 40) & 0xff;
+	p[6] = (x >> 48) & 0xff;
+	p[7] = (x >> 56) & 0xff;
+}
+#endif
+
 #if JANSSON_MAJOR_VERSION >= 2
 #define JSON_LOADS(str, err_ptr) json_loads(str, 0, err_ptr)
 #define JSON_LOAD_FILE(path, err_ptr) json_load_file(path, 0, err_ptr)
@@ -158,6 +199,14 @@ extern unsigned char *scrypt_buffer_alloc(int N);
 extern int scanhash_scrypt(int thr_id, uint32_t *pdata,
 	unsigned char *scratchbuf, const uint32_t *ptarget,
 	uint32_t max_nonce, unsigned long *hashes_done, int N);
+
+/* MintMe / Webchain: Lyra2-webchain (LYRA2, tcost=4, NROWS=16384, ~6MB per thread) */
+extern int scanhash_lyra2web(int thr_id, uint32_t *pdata,
+	const unsigned char *blob, size_t blob_size,
+	unsigned char *scratchbuf, const uint32_t *ptarget,
+	uint32_t max_nonce, unsigned long *hashes_done);
+extern unsigned char *lyra2web_buffer_alloc(void);
+extern bool lyra2web_test(void);
 
 struct thr_info {
 	int		id;
@@ -241,15 +290,26 @@ struct stratum_ctx {
 	size_t xnonce2_size;
 	struct stratum_job job;
 	pthread_mutex_t work_lock;
+
+	/* Webchain (MintMe) stratum: login/job/submit/keepalived */
+	bool is_webchain;
+	char *wc_rpc_id;
+	int wc_seq;
+	char *wc_job_id;
+	unsigned char *wc_blob;
+	size_t wc_blob_len;
+	unsigned char wc_target[8];
 };
 
 bool stratum_socket_full(struct stratum_ctx *sctx, int timeout);
 bool stratum_send_line(struct stratum_ctx *sctx, char *s);
 char *stratum_recv_line(struct stratum_ctx *sctx);
+char *stratum_recv_line_timeout(struct stratum_ctx *sctx, int timeout);
 bool stratum_connect(struct stratum_ctx *sctx, const char *url);
 void stratum_disconnect(struct stratum_ctx *sctx);
 bool stratum_subscribe(struct stratum_ctx *sctx);
 bool stratum_authorize(struct stratum_ctx *sctx, const char *user, const char *pass);
+bool stratum_webchain_login(struct stratum_ctx *sctx, const char *user, const char *pass);
 bool stratum_handle_method(struct stratum_ctx *sctx, const char *s);
 
 struct thread_q;
