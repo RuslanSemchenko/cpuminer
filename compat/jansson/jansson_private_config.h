@@ -24,25 +24,40 @@
 /* ssize_t available via sys/types.h on all platforms */
 #define HAVE_SSIZE_T 1
 
-/* Standard headers available on all supported platforms */
+/*
+ * Standard headers available on all supported platforms. endian.h is
+ * GNU libc specific (Linux); on macOS/FreeBSD endianness is defined via
+ * <sys/param.h> instead, so define HAVE_ENDIAN_H only on Linux.
+ */
 #define HAVE_INTTYPES_H 1
 #define HAVE_SYS_TYPES_H 1
 #define HAVE_SYS_PARAM_H 1
 #define HAVE_SYS_STAT_H 1
 #define HAVE_SYS_TIME_H 1
+#if defined(__linux__)
+#define HAVE_ENDIAN_H 1
+#endif
+/* unistd/fcntl/sched exist on POSIX only (not on native Windows/MinGW) */
+#if !defined(_WIN32)
 #define HAVE_UNISTD_H 1
 #define HAVE_FCNTL_H 1
 #define HAVE_SCHED_H 1
-#define HAVE_ENDIAN_H 1
+#endif
 
-/* POSIX I/O needed for random seed generation (hashtable_seed.c) */
+/*
+ * Random seed generation (hashtable_seed.c).
+ * On POSIX, seed comes from /dev/urandom; on native Windows, jansson
+ * falls back to the CryptoAPI (USE_WINDOWS_CRYPTOAPI handled in-code).
+ */
 #define USE_URANDOM 1
+#if !defined(_WIN32)
 #define HAVE_OPEN 1
 #define HAVE_CLOSE 1
 #define HAVE_READ 1
 #define HAVE_GETTIMEOFDAY 1
 #define HAVE_GETPID 1
 #define HAVE_SCHED_YIELD 1
+#endif
 #define HAVE_SYNC_BUILTINS 1
 
 #endif /* JANSSON_PRIVATE_CONFIG_H */
