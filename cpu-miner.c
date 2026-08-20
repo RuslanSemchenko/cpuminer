@@ -56,7 +56,7 @@ static inline void drop_policy(void)
 #endif
 }
 
-static inline void affine_to_cpu(int id, int cpu)
+static inline void affine_to_cpu(int cpu)
 {
 	cpu_set_t set;
 
@@ -70,7 +70,7 @@ static inline void drop_policy(void)
 {
 }
 
-static inline void affine_to_cpu(int id, int cpu)
+static inline void affine_to_cpu(int cpu)
 {
 	cpuset_t set;
 	CPU_ZERO(&set);
@@ -82,8 +82,9 @@ static inline void drop_policy(void)
 {
 }
 
-static inline void affine_to_cpu(int id, int cpu)
+static inline void affine_to_cpu(int cpu)
 {
+	(void)cpu;
 }
 #endif
 		
@@ -332,9 +333,9 @@ static bool work_decode(const json_t *val, struct work *work)
 		goto err_out;
 	}
 
-	for (i = 0; i < ARRAY_SIZE(work->data); i++)
+	for (i = 0; i < (int)ARRAY_SIZE(work->data); i++)
 		work->data[i] = le32dec(work->data + i);
-	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+	for (i = 0; i < (int)ARRAY_SIZE(work->target); i++)
 		work->target[i] = le32dec(work->target + i);
 
 	return true;
@@ -599,7 +600,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 			}
 			memrev(merkle_tree[1 + i], 32);
 		} else {
-			if (tx_size > tx_buf_size) {
+			if (tx_size > (ssize_t)tx_buf_size) {
 				free(tx);
 				tx_buf_size = tx_size * 2;
 				tx = malloc(tx_buf_size);
@@ -643,7 +644,7 @@ static bool gbt_work_decode(const json_t *val, struct work *work)
 		applog(LOG_ERR, "JSON invalid target");
 		goto out;
 	}
-	for (i = 0; i < ARRAY_SIZE(work->target); i++)
+	for (i = 0; i < (int)ARRAY_SIZE(work->target); i++)
 		work->target[7 - i] = be32dec(target + i);
 
 	tmp = json_object_get(val, "workid");
@@ -742,7 +743,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 	} else if (work->txs) {
 		char *req;
 
-		for (i = 0; i < ARRAY_SIZE(work->data); i++)
+		for (i = 0; i < (int)ARRAY_SIZE(work->data); i++)
 			be32enc(work->data + i, work->data[i]);
 		bin2hex(data_str, (unsigned char *)work->data, 80);
 		if (work->workid) {
@@ -790,7 +791,7 @@ static bool submit_upstream_work(CURL *curl, struct work *work)
 		json_decref(val);
 	} else {
 		/* build hex string */
-		for (i = 0; i < ARRAY_SIZE(work->data); i++)
+		for (i = 0; i < (int)ARRAY_SIZE(work->data); i++)
 			le32enc(work->data + i, work->data[i]);
 		bin2hex(data_str, (unsigned char *)work->data, sizeof(work->data));
 
@@ -1091,7 +1092,7 @@ static void stratum_gen_work(struct stratum_ctx *sctx, struct work *work)
 	}
 	
 	/* Increment extranonce2 */
-	for (i = 0; i < sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
+	for (i = 0; i < (int)sctx->xnonce2_size && !++sctx->job.xnonce2[i]; i++);
 
 	/* Assemble block header */
 	memset(work->data, 0, 128);
@@ -1124,7 +1125,8 @@ static void *miner_thread(void *userdata)
 {
 	struct thr_info *mythr = userdata;
 	int thr_id = mythr->id;
-	struct work work = {{0}};
+	struct work work;
+	memset(&work, 0, sizeof(work));
 	uint32_t max_nonce;
 	uint32_t end_nonce = 0xffffffffU / opt_n_threads * (thr_id + 1) - 0x20;
 	unsigned char *scratchbuf = NULL;
@@ -1145,7 +1147,7 @@ static void *miner_thread(void *userdata)
 		if (!opt_quiet)
 			applog(LOG_INFO, "Binding thread %d to cpu %d",
 			       thr_id, thr_id % num_processors);
-		affine_to_cpu(thr_id, thr_id % num_processors);
+		affine_to_cpu(thr_id % num_processors);
 	}
 	
 	if (opt_algo == ALGO_SCRYPT) {
@@ -1559,8 +1561,8 @@ static void parse_arg(int key, char *arg, char *pname)
 
 	switch(key) {
 	case 'a':
-		for (i = 0; i < ARRAY_SIZE(algo_names); i++) {
-			v = strlen(algo_names[i]);
+	for (i = 0; i < (int)ARRAY_SIZE(algo_names); i++) {
+		v = strlen(algo_names[i]);
 			if (!strncmp(arg, algo_names[i], v)) {
 				if (arg[v] == '\0') {
 					opt_algo = i;
@@ -1577,7 +1579,7 @@ static void parse_arg(int key, char *arg, char *pname)
 				}
 			}
 		}
-		if (i == ARRAY_SIZE(algo_names)) {
+		if (i == (int)ARRAY_SIZE(algo_names)) {
 			fprintf(stderr, "%s: unknown algorithm -- '%s'\n",
 				pname, arg);
 			show_usage_and_exit(1);
@@ -1779,8 +1781,10 @@ static void parse_arg(int key, char *arg, char *pname)
 		break;
 	case 'V':
 		show_version_and_exit();
+		/* fall through */
 	case 'h':
 		show_usage_and_exit(0);
+		/* fall through */
 	default:
 		show_usage_and_exit(1);
 	}
@@ -1792,7 +1796,7 @@ static void parse_config(json_t *config, char *pname, char *ref)
 	char *s;
 	json_t *val;
 
-	for (i = 0; i < ARRAY_SIZE(options); i++) {
+	for (i = 0; i < (int)ARRAY_SIZE(options); i++) {
 		if (!options[i].name)
 			break;
 

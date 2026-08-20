@@ -217,6 +217,7 @@ int hashtable_init(hashtable_t *hashtable,
 
     hashtable->size = 0;
     hashtable->num_buckets = 0;  /* index to primes[] */
+    (void)num_primes;
     hashtable->buckets = malloc(num_buckets(hashtable) * sizeof(bucket_t));
     if(!hashtable->buckets)
         return -1;

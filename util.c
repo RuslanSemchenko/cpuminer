@@ -294,6 +294,8 @@ out:
 static int sockopt_keepalive_cb(void *userdata, curl_socket_t fd,
 	curlsocktype purpose)
 {
+	(void)userdata;
+	(void)purpose;
 	int keepalive = 1;
 	int tcp_keepcnt = 3;
 	int tcp_keepidle = 50;
@@ -492,7 +494,7 @@ void memrev(unsigned char *p, size_t len)
 
 void bin2hex(char *s, const unsigned char *p, size_t len)
 {
-	int i;
+	size_t i;
 	for (i = 0; i < len; i++)
 		sprintf(s + (i * 2), "%02x", (unsigned int) p[i]);
 }
@@ -608,8 +610,10 @@ static bool b58dec(unsigned char *bin, size_t binsz, const char *b58)
 	switch (rem) {
 		case 3:
 			*(bin++) = (outi[0] >> 16) & 0xff;
+			/* fall through */
 		case 2:
 			*(bin++) = (outi[0] >> 8) & 0xff;
+			/* fall through */
 		case 1:
 			*(bin++) = outi[0] & 0xff;
 			++j;

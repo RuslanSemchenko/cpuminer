@@ -92,7 +92,7 @@ static void error_set(json_error_t *error, const lex_t *lex,
         {
             if(lex->saved_text.length <= 20) {
                 snprintf(error->text, JSON_ERROR_TEXT_LENGTH,
-                         "%s near '%s'", text, saved_text);
+                         "%.139s near '%s'", text, saved_text);
             }
             else
                 snprintf(error->text, JSON_ERROR_TEXT_LENGTH, "%s", text);
@@ -100,7 +100,7 @@ static void error_set(json_error_t *error, const lex_t *lex,
         else
         {
             snprintf(error->text, JSON_ERROR_TEXT_LENGTH,
-                     "%s near end of file", text);
+                     "%.139s near end of file", text);
         }
     }
     else
