@@ -186,7 +186,7 @@ jobs:
           # Seed the corpus with small valid JSON samples
           printf '{"method":"getwork","params":[],"id":1}' > fuzz-corpus-json/seed_getwork.json
           printf '{"job_id":"x","xnonce2":"1234","ntime":"5a6b7c8d","nbits":"1d00ffff","coinbase":[],"merkles":[],"version":"20000000","prevhash":"0000000000000000000000000000000000000000000000000000000000000000"}' > fuzz-corpus-json/seed_stratum.json
-          timeout 60s ./fuzz-build/fuzz_json fuzz-corpus-json -max_total_time=45 -report_slow_units=1 || true
+          timeout 130s ./fuzz-build/fuzz_json fuzz-corpus-json -max_total_time=130 -report_slow_units=1 || true
           mkdir -p $BUILD_OUTPUT_DIR
           cp -r fuzz-corpus-json $BUILD_OUTPUT_DIR/ || true
 
@@ -195,7 +195,7 @@ jobs:
           set -euo pipefail
           mkdir -p fuzz-corpus-bin
           printf '0123456789abcdef' > fuzz-corpus-bin/seed_hex.txt
-          timeout 60s ./fuzz-build/fuzz_bin fuzz-corpus-bin -max_total_time=45 -report_slow_units=1 || true
+          timeout 130s ./fuzz-build/fuzz_bin fuzz-corpus-bin -max_total_time=130 -report_slow_units=1 || true
           cp -r fuzz-corpus-bin $BUILD_OUTPUT_DIR/ || true
 
       - name: Upload fuzz artifacts
